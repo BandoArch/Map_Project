@@ -5,6 +5,7 @@
  */
 
 #include <Arduino.h>
+#include <esp_log.h>
 #include "map_storage.h"
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
@@ -30,10 +31,16 @@ lv_obj_t *map_state_label;
 lv_obj_t *map_detail_label;
 lv_obj_t *map_heading;
 lv_obj_t *gps_detail;
-int zoom_level = 15;
+lv_obj_t *attribution_label;
+lv_obj_t *layer_button_label;
+bool satellite_mode = false;
+bool pending_layer_toggle = false;
+int zoom_level = 16;
+int pending_zoom = -1;
 bool tile_upload_active = false;
 
 bool show_map_tile(int zoom);
+void check_map_storage();
 int waypoint_count = 0;
 bool sd_ready = false;
 
@@ -110,23 +117,32 @@ void poll_serial_test()
                 Serial.println("SDTEST ERROR command too long");
             } else if (strcmp(command, "SDDIAG") == 0) {
                 lvgl_port_lock(-1);
+                if (!sd_ready) check_map_storage();
                 map_storage_diagnostics();
+                if (sd_ready) show_map_tile(zoom_level);
                 lvgl_port_unlock();
             } else if (strncmp(command, "SDTEST ", 7) == 0) {
                 lvgl_port_lock(-1);
                 handle_sd_upload_test(command + 7);
                 lvgl_port_unlock();
-            } else if (strncmp(command, "TILEPUT ", 8) == 0) {
+            } else if (strncmp(command, "TILEPUT ", 8) == 0 || strncmp(command, "OSMPUT ", 7) == 0 || strncmp(command, "SATPUT ", 7) == 0) {
                 if (!sd_ready) {
                     Serial.println("TILE ERROR SD card is not mounted");
                 } else {
                     lvgl_port_lock(-1);
                     tile_upload_active = true;
                     lvgl_port_unlock();
-                    const int zoom = tile_map_receive(command + 8);
+                    const bool osm_file = command[0] == 'O';
+                    const bool satellite_file = command[0] == 'S';
+                    const int zoom = tile_map_receive(command + ((osm_file || satellite_file) ? 7 : 8), osm_file, satellite_file);
                     lvgl_port_lock(-1);
                     tile_upload_active = false;
-                    if (zoom >= 0) show_map_tile(zoom);
+                    if (zoom >= 0) {
+                        tile_map_clear_cache();
+                        if (satellite_file) satellite_mode = true;
+                        tile_map_set_satellite(satellite_mode);
+                        show_map_tile(satellite_file ? zoom_level : zoom);
+                    }
                     lvgl_port_unlock();
                 }
             }
@@ -170,19 +186,85 @@ void on_zoom(lv_event_t *event)
 {
     if (tile_upload_active) return;
     const int change = static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
-    const int requested = constrain(zoom_level + change, 14, 16);
-    if (!show_map_tile(requested)) {
-        lv_label_set_text(map_state_label, "TILE NOT UPLOADED");
-        lv_obj_clear_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
+    // Rendering needs more stack than the LVGL event task can provide.
+    pending_zoom = constrain((pending_zoom >= 0 ? pending_zoom : zoom_level) + change, 14, 18);
+}
+
+void on_layer_toggle(lv_event_t *)
+{
+    if (!tile_upload_active) pending_layer_toggle = !pending_layer_toggle;
+}
+
+void on_map_drag(lv_event_t *event)
+{
+    static lv_point_t previous;
+    static bool dragging = false;
+    const auto code = lv_event_get_code(event);
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (dragging) Serial.println("MAP PAN finished");
+        dragging = false;
+        return;
     }
+    if (tile_upload_active || !sd_ready) {
+        dragging = false;
+        return;
+    }
+    lv_indev_t *input = lv_indev_get_act();
+    if (!input) return;
+    lv_point_t point;
+    lv_indev_get_point(input, &point);
+    if (code == LV_EVENT_PRESSED) {
+        previous = point;
+        dragging = true;
+    } else if (code == LV_EVENT_PRESSING && dragging) {
+        tile_map_pan(point.x - previous.x, point.y - previous.y);
+        previous = point;
+    }
+}
+
+void poll_map_zoom()
+{
+    lvgl_port_lock(-1);
+    if (!tile_upload_active && pending_layer_toggle) {
+        pending_layer_toggle = false;
+        satellite_mode = !satellite_mode;
+        tile_map_set_satellite(satellite_mode);
+        lv_label_set_text(layer_button_label, satellite_mode ? "MAP" : "SAT");
+        if (!show_map_tile(zoom_level)) {
+            lv_label_set_text(map_state_label, satellite_mode ? "SATELLITE UNAVAILABLE" : "MAP UNAVAILABLE");
+            lv_obj_clear_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (!tile_upload_active && pending_zoom >= 0) {
+        const int requested = pending_zoom;
+        pending_zoom = -1;
+        if (requested != zoom_level) {
+            Serial.printf("MAP ZOOM requested=%d\n", requested);
+            if (!show_map_tile(requested)) {
+                lv_label_set_text(map_state_label, "MAP VIEW UNAVAILABLE");
+                lv_obj_clear_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+    lvgl_port_unlock();
 }
 
 bool show_map_tile(int zoom)
 {
-    if (!sd_ready || !tile_map_load(zoom)) return false;
+    if (!sd_ready) return false;
+    if (!tile_map_load(zoom)) {
+        if (!map_storage_check()) {
+            sd_ready = false;
+            tile_map_clear_cache();
+            map_storage_end();
+        }
+        return false;
+    }
     zoom_level = zoom;
-    lv_label_set_text_fmt(zoom_label, "ZOOM %02d", zoom_level);
-    lv_label_set_text(map_heading, "THIKA / MAP TEST");
+    lv_label_set_text_fmt(zoom_label, "VIEW %02d", zoom_level);
+    lv_label_set_text(map_heading, satellite_mode ? "SAT / 2016" : "SD / OSM MAP");
+    lv_label_set_text(layer_button_label, satellite_mode ? "MAP" : "SAT");
+    lv_label_set_text(attribution_label, satellite_mode ? "EOX s2maps.eu / 2016 / CC BY 4.0" : "(c) OpenStreetMap contributors");
     lv_obj_add_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(map_detail_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(gps_detail, LV_OBJ_FLAG_HIDDEN);
@@ -232,6 +314,10 @@ void create_navigation_screen()
     lv_obj_set_style_radius(map_panel, 5, 0);
     lv_obj_set_style_pad_all(map_panel, 0, 0);
     lv_obj_clear_flag(map_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(map_panel, on_map_drag, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(map_panel, on_map_drag, LV_EVENT_PRESSING, nullptr);
+    lv_obj_add_event_cb(map_panel, on_map_drag, LV_EVENT_RELEASED, nullptr);
+    lv_obj_add_event_cb(map_panel, on_map_drag, LV_EVENT_PRESS_LOST, nullptr);
 
     // Create image first so labels and controls are drawn above it.
     tile_map_create(map_panel);
@@ -272,6 +358,11 @@ void create_navigation_screen()
     lv_obj_align(mark_button, LV_ALIGN_BOTTOM_LEFT, 8, -8);
     lv_obj_add_event_cb(mark_button, on_mark_waypoint, LV_EVENT_CLICKED, nullptr);
 
+    lv_obj_t *layer_button = make_button(map_panel, "SAT", 48, 30);
+    lv_obj_align(layer_button, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    layer_button_label = lv_obj_get_child(layer_button, 0);
+    lv_obj_add_event_cb(layer_button, on_layer_toggle, LV_EVENT_CLICKED, nullptr);
+
     lv_obj_t *coordinates = make_label(screen, "LAT --.------  LON --.------", &lv_font_montserrat_12, COLOR_TEXT);
     lv_obj_set_pos(coordinates, margin + 1, screen_height - footer_height + 1);
 
@@ -282,6 +373,7 @@ void create_navigation_screen()
     lv_obj_align(waypoint_label, LV_ALIGN_BOTTOM_RIGHT, -margin, -20);
 
     lv_obj_t *storage_state = make_label(screen, "(c) OpenStreetMap contributors", &lv_font_montserrat_10, COLOR_MUTED);
+    attribution_label = storage_state;
     lv_obj_set_width(storage_state, screen_width - margin * 2);
     lv_label_set_long_mode(storage_state, LV_LABEL_LONG_CLIP);
     lv_obj_set_pos(storage_state, margin + 1, screen_height - 19);
@@ -289,15 +381,15 @@ void create_navigation_screen()
 
 void check_map_storage()
 {
-    Serial.println("Initializing SD card over native SD/MMC");
+    sd_ready = false;
+    Serial.println("Initializing SD card");
     if (!map_storage_begin()) {
         Serial.println("SD card mount failed");
         lv_label_set_text(map_state_label, "SD CARD NOT FOUND");
-        lv_label_set_text(map_detail_label, "Check card / fully power cycle");
+        lv_label_set_text(map_detail_label, "Insert SD card; retrying automatically");
         return;
     }
 
-    sd_ready = true;
     File map_file = map_storage().open("/map.osm", FILE_READ);
     if (!map_file) {
         Serial.println("Card mounted, but /map.osm was not found");
@@ -321,8 +413,45 @@ void check_map_storage()
         return;
     }
 
+    sd_ready = true;
     lv_label_set_text(map_state_label, "OSM FILE READY");
     lv_label_set_text_fmt(map_detail_label, "%u KB  /sd/map.osm", file_size_kb);
+}
+
+void poll_map_storage()
+{
+    static uint32_t last_check = 0;
+    const uint32_t now = millis();
+    if (now - last_check < 3000) return;
+
+    // Serialize card recovery and cached image changes with the UI.
+    lvgl_port_lock(-1);
+    if (!tile_upload_active) {
+        if (sd_ready && !map_storage_check()) {
+            Serial.println("STORAGE card removed or unreadable; unmounting");
+            sd_ready = false;
+            pending_zoom = -1;
+            tile_map_clear_cache();
+            map_storage_end();
+            lv_label_set_text(map_state_label, "SD CARD NOT FOUND");
+            lv_label_set_text(map_detail_label, "Insert SD card; retrying automatically");
+            lv_obj_clear_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(map_detail_label, LV_OBJ_FLAG_HIDDEN);
+        } else if (!sd_ready) {
+            check_map_storage();
+            if (!sd_ready) map_storage_end();
+            if (sd_ready && !show_map_tile(zoom_level)) {
+                lv_label_set_text(map_state_label, "MAP READ FAILED");
+                lv_label_set_text(map_detail_label, "Retrying SD card automatically");
+            }
+            if (!sd_ready) {
+                lv_obj_clear_flag(map_state_label, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(map_detail_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+    last_check = millis();
+    lvgl_port_unlock();
 }
 
 }
@@ -330,6 +459,12 @@ void check_map_storage()
 void setup()
 {
     Serial.begin(115200);
+    Serial.setTxTimeoutMs(1000);
+    Serial.setDebugOutput(true);
+    // Native USB must receive the driver errors as well as application messages.
+    esp_log_set_vprintf([](const char *format, va_list args) {
+        return static_cast<int>(Serial.vprintf(format, args));
+    });
 
     Serial.println("Initializing board");
     Board *board = new Board();
@@ -356,9 +491,9 @@ void setup()
 
     lvgl_port_lock(-1);
     check_map_storage();
-    if (sd_ready && !show_map_tile(15)) {
-        lv_label_set_text(map_state_label, "NO THIKA TILES");
-        lv_label_set_text(map_detail_label, "Upload tiles over USB");
+    if (sd_ready && !show_map_tile(zoom_level)) {
+        lv_label_set_text(map_state_label, "MAP DATA UNAVAILABLE");
+        lv_label_set_text(map_detail_label, "Check /map.osm geometry");
     }
     lvgl_port_unlock();
 }
@@ -366,5 +501,7 @@ void setup()
 void loop()
 {
     poll_serial_test();
+    poll_map_zoom();
+    poll_map_storage();
     delay(10);
 }
